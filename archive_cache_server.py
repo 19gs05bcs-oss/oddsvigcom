@@ -242,13 +242,28 @@ class ArchiveCacheServer:
                 return self.headers.get("Authorization") == f"Bearer {server.auth_token}"
 
             def _send_json_gz(self, gz_bytes: bytes, status: int = 200) -> None:
+                # Istemci gercekten gzip kabul ediyorsa (tarayici / fetch / --compressed
+                # curl) sikistirilmis gonder; etmiyorsa (duz curl, Koyeb'in proxy'si vb.)
+                # duz JSON'a cevirip Content-Encoding basma. Aksi halde araya giren
+                # proxy'ler govdeyi kendileri decompress edip header'i degistirmeden
+                # birakabiliyor, bu da istemci tarafinda "unknown compression format"
+                # hatasina yol aciyor.
+                accept_encoding = self.headers.get("Accept-Encoding", "")
+                client_wants_gzip = "gzip" in accept_encoding.lower()
+
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Encoding", "gzip")
-                self.send_header("Content-Length", str(len(gz_bytes)))
                 self.send_header("Cache-Control", "public, max-age=30")
-                self.end_headers()
-                self.wfile.write(gz_bytes)
+                if client_wants_gzip:
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Content-Length", str(len(gz_bytes)))
+                    self.end_headers()
+                    self.wfile.write(gz_bytes)
+                else:
+                    body = gzip.decompress(gz_bytes)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
 
             def _send_json(self, obj: dict, status: int = 200) -> None:
                 body = json.dumps(obj).encode("utf-8")
@@ -262,6 +277,8 @@ class ArchiveCacheServer:
                 try:
                     parsed = urlparse(self.path)
                     path = parsed.path
+                    if len(path) > 1 and path.endswith("/"):
+                        path = path.rstrip("/")  # /health/ -> /health, /seasons/ -> /seasons
 
                     if path == "/health":
                         self._send_json(server.stats())
