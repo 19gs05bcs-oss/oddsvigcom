@@ -42,11 +42,9 @@ import gzip
 import hashlib
 import io
 import json
-import re
 import sys
 import threading
 import time
-from collections import OrderedDict
 
 import requests
 
@@ -59,23 +57,6 @@ from flashscore_markets import (
 
 API_ROOT = "https://api.github.com"
 SOURCE = "flashscore"
-
-# listener repo dosya adlari ..._YYYYMMDD_HHMMSS.json.gz seklinde bitiyor.
-# Bu format lexicographic == kronolojik siralanir, o yuzden string
-# karsilastirmasi yeterli (datetime parse etmeye gerek yok).
-_TS_RE = re.compile(r"_(\d{8}_\d{6})\.json\.gz$")
-
-# load_events() ve load_quotes() genelde ayni sezon icin arka arkaya
-# cagrilir (frontend bir sezonu ac -> hem events hem quotes ister).
-# Ikisi de ayni ham (decompress edilmis) season JSON'undan turedigi icin
-# son N indirilen ham dosyayi kisa sureli tutup GitHub'a cift indirme
-# yapmamak icin kucuk bir paylasili cache.
-_RAW_CACHE_MAX = 3
-
-
-def _extract_ts(name: str) -> str:
-    m = _TS_RE.search(name)
-    return m.group(1) if m else ""
 
 
 def _gh_headers(token: str) -> dict:
@@ -111,6 +92,29 @@ def _slim_blob(blob: dict) -> dict:
             "selections": sels,
         })
     return {"bookmakers": blob.get("bookmakers") or {}, "markets": markets}
+
+
+def _quote_rows_from_odds(odds: list, event_id: str, season_slug: str, kickoff: str | None) -> list[dict]:
+    """watcher.py'nin quote_rows_from_fixture() ile BİREBİR AYNI mantık —
+    markets_json'u unnest etmeye gerek yok, ham odds listesi zaten flat."""
+    out: list[dict] = []
+    for row in odds or []:
+        if not (isinstance(row, list) and len(row) >= 7):
+            continue
+        bm_id, btype, bscope, side, opening, current, active = row[:7]
+        out.append({
+            "event_id": event_id,
+            "season_slug": season_slug,
+            "bookmaker_id": int(bm_id) if bm_id not in (None, "") else None,
+            "betting_type": btype,
+            "betting_scope": bscope,
+            "side": str(side),
+            "opening": float(opening) if opening not in (None, "") else None,
+            "current": float(current) if current not in (None, "") else None,
+            "active": bool(active) if active is not None else True,
+            "kickoff_at": kickoff,
+        })
+    return out
 
 
 def _match_to_event(m: dict, league_slug: str, bookmakers: dict, ts: str) -> dict:
@@ -164,32 +168,6 @@ def _match_to_event(m: dict, league_slug: str, bookmakers: dict, ts: str) -> dic
     }
 
 
-def _quote_rows_from_match(m: dict, event_id: str, season_slug: str, kickoff_at: str | None) -> list[dict]:
-    """watcher.quote_rows_from_fixture ile BIREBIR ayni donusum — canli
-    (Supabase fixture) veya arsiv (GitHub season json) fark etmeksizin
-    quotes semasi ayni. build_markets_blob'a hic girmiyor (bookmaker
-    adi/gorsel grid gerekmiyor), bu yuzden load_events'ten cok daha
-    hafif bir yol."""
-    out: list[dict] = []
-    for row in m.get("odds") or []:
-        if not (isinstance(row, list) and len(row) >= 7):
-            continue
-        bm_id, btype, bscope, side, opening, current, active = row[:7]
-        out.append({
-            "event_id": event_id,
-            "season_slug": season_slug,
-            "bookmaker_id": int(bm_id) if bm_id not in (None, "") else None,
-            "betting_type": btype,
-            "betting_scope": bscope,
-            "side": str(side),
-            "opening": float(opening) if opening not in (None, "") else None,
-            "current": float(current) if current not in (None, "") else None,
-            "active": bool(active) if active is not None else True,
-            "kickoff_at": kickoff_at,
-        })
-    return out
-
-
 class GithubArchiveSource:
     def __init__(self, repo: str, ref: str, path: str, token: str):
         self.repo = repo
@@ -198,15 +176,10 @@ class GithubArchiveSource:
         self.token = token
 
         self._lock = threading.RLock()
-        # slug -> {"sha","name","match_count","bookmaker_count","season_label","template_id","season_code","ts"}
+        # slug -> {"sha","name","match_count","bookmaker_count","season_label","template_id","season_code"}
         self._index: dict[str, dict] = {}
         self._ready = False
         self._error: str | None = None
-
-        # slug -> ham (decode edilmis) season JSON'u — load_events/load_quotes
-        # arasinda kisa sureli paylasilir, cift GitHub indirmesini onler
-        self._raw_lock = threading.RLock()
-        self._raw_cache: "OrderedDict[str, dict]" = OrderedDict()
 
     # ---------------- GitHub HTTP ----------------
 
@@ -242,23 +215,6 @@ class GithubArchiveSource:
         with gzip.GzipFile(fileobj=io.BytesIO(raw)) as f:
             return json.loads(f.read().decode("utf-8"))
 
-    def _load_season_json_cached(self, slug: str, sha: str) -> dict:
-        """load_events/load_quotes ortak girisi. Ayni sezon kisa sure icinde
-        iki kez istenirse (events sonra quotes, ya da tam tersi) GitHub'a
-        ikinci kez gitmez — kucuk bir LRU'da ham JSON'u tutar."""
-        with self._raw_lock:
-            data = self._raw_cache.get(slug)
-            if data is not None:
-                self._raw_cache.move_to_end(slug)
-                return data
-        data = self._load_season_json(sha)
-        with self._raw_lock:
-            self._raw_cache[slug] = data
-            self._raw_cache.move_to_end(slug)
-            while len(self._raw_cache) > _RAW_CACHE_MAX:
-                self._raw_cache.popitem(last=False)
-        return data
-
     # ---------------- Index (hafif — sadece meta) ----------------
 
     def build_index(self) -> None:
@@ -273,31 +229,15 @@ class GithubArchiveSource:
               file=sys.stderr)
         index: dict[str, dict] = {}
         for i, item in enumerate(items, 1):
-            ts = _extract_ts(item["name"])
             try:
                 data = self._load_season_json(item["sha"])
             except Exception as exc:  # noqa: BLE001
                 print(f"[github-archive] [!] {item['name']} atlandi: {exc}", file=sys.stderr)
                 continue
             slug = data.get("league_slug") or item["name"]
-
-            existing = index.get(slug)
-            if existing is not None and ts <= existing["ts"]:
-                # ayni league_slug'a denk gelen daha eski (veya ayni zaman
-                # damgali) kopya — mevcut (daha yeni) kaydi koru, GitHub API
-                # listeleme sirasindan bagimsiz calisir (name ts'ye gore
-                # lexicographic = kronolojik)
-                print(
-                    f"[github-archive] {item['name']} atlandi (eski kopya, "
-                    f"slug={slug}, tutulan={existing['name']})",
-                    file=sys.stderr,
-                )
-                continue
-
             index[slug] = {
                 "sha": item["sha"],
                 "name": item["name"],
-                "ts": ts,
                 "match_count": len(data.get("matches") or []),
                 "bookmaker_count": len(data.get("bookmakers") or {}),
                 "season_label": season_label_from_slug(slug),
@@ -353,7 +293,7 @@ class GithubArchiveSource:
             entry = self._index.get(slug)
         if entry is None:
             return None
-        data = self._load_season_json_cached(slug, entry["sha"])
+        data = self._load_season_json(entry["sha"])
         bookmakers = data.get("bookmakers") or {}
         league_slug = data.get("league_slug") or slug
         ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -363,25 +303,22 @@ class GithubArchiveSource:
         ]
 
     def load_quotes(self, slug: str) -> list[dict] | None:
-        """load_events ile AYNI ham dosyadan (raw-cache sayesinde cogu zaman
-        ikinci bir GitHub indirmesi olmadan) flat quotes satirlari uretir.
-        markets_json donusumune (build_markets_blob) hic girmez — compact
-        'odds' satirlari zaten quotes semasiyla birebir ayni, sadece
-        watcher.quote_rows_from_fixture ile ayni sekle sokuluyor.
-        ArchiveCacheServer.get_quotes_season_gz() tarafindan Postgres
-        'quotes' tablosundan gelen satirlar gibi islenir (LRU'ya girer)."""
+        """Tek sezonu GitHub'dan indirir + FLAT quote satirlarina cevirir
+        (markets_json'u hic unnest etmeden — ham odds listesi zaten flat).
+        get_quotes_season_gz()'in Postgres-miss durumundaki karsiligi;
+        donen liste watcher.py'nin quote_rows_from_fixture() ciktisiyla
+        BİREBİR AYNI sekildedir, ArchiveCacheServer bu ikisini ayirt etmez."""
         with self._lock:
             entry = self._index.get(slug)
         if entry is None:
             return None
-        data = self._load_season_json_cached(slug, entry["sha"])
-        league_slug = data.get("league_slug") or slug
-        rows: list[dict] = []
+        data = self._load_season_json(entry["sha"])
+        out: list[dict] = []
         for m in (data.get("matches") or []):
             mid = m.get("match_id")
             if not mid:
                 continue
             event_id = f"{SOURCE}:{mid}"
-            kickoff_at = kickoff_iso(m.get("kickoff_ts"))
-            rows.extend(_quote_rows_from_match(m, event_id, league_slug, kickoff_at))
-        return rows
+            kickoff = kickoff_iso(m.get("kickoff_ts"))
+            out.extend(_quote_rows_from_odds(m.get("odds") or [], event_id, slug, kickoff))
+        return out
