@@ -1,0 +1,64 @@
+name: Import season odds (listener -> Supabase)
+
+# Manuel tetikleme. LISTENER_PAT: listener repo private oldugu icin
+# secrets.GITHUB_TOKEN (bu repoyla sinirli) yeterli degil — ayri bir
+# PAT (fine-grained, sadece 19gs05bcs-oss/listener'a contents:read,
+# ya da classic PAT + repo scope) Settings > Secrets > Actions altina
+# LISTENER_PAT adiyla eklenmeli.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "listener repo commit sha / branch"
+        required: true
+        default: "8b54e0432190b2d5eff589dabaf139cef2433f23"
+      limit:
+        description: "test icin ilk N dosyayla sinirla (0 = hepsi)"
+        required: false
+        default: "0"
+      do_import:
+        description: "Supabase'e yaz (false = sadece indir/dry)"
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # 283 dosya + import icin pay birak (max 360)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      # onceki run'dan kalan indirilmis/import edilmis dosyalari geri yukle
+      # (manifest sayesinde script kaldigi yerden devam eder)
+      - uses: actions/cache@v4
+        with:
+          path: season_odds_cache
+          key: season-odds-${{ github.run_id }}
+          restore-keys: |
+            season-odds-
+
+      - name: Bulk import
+        env:
+          GITHUB_TOKEN: ${{ secrets.LISTENER_PAT }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          ARGS="--ref ${{ inputs.ref }} --out-dir season_odds_cache"
+          if [ "${{ inputs.limit }}" != "0" ]; then
+            ARGS="$ARGS --limit ${{ inputs.limit }}"
+          fi
+          if [ "${{ inputs.do_import }}" = "true" ]; then
+            ARGS="$ARGS --import"
+          fi
+          python3 bulk_import_github_seasons.py $ARGS
+
+      # cache action job sonunda otomatik kaydeder (exact key hep miss
+      # oldugu icin her run yeni bir cache birakir, restore-keys ile
+      # bir sonraki run en guncelini bulur)
