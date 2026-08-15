@@ -72,6 +72,7 @@ ONCE = (os.environ.get("ONCE") or "").strip().lower() in ("1", "true", "yes")
 
 CACHE_API_TOKEN = os.environ.get("CACHE_API_TOKEN", "")
 CACHE_MAX_MB = int(os.environ.get("CACHE_MAX_MB", "300"))
+QUOTES_CACHE_MAX_MB = int(os.environ.get("QUOTES_CACHE_MAX_MB", "150"))
 CACHE_PORT = int(os.environ.get("PORT", "8000"))
 
 cache_server = ArchiveCacheServer(
@@ -79,6 +80,7 @@ cache_server = ArchiveCacheServer(
     supabase_key=SUPABASE_KEY,
     auth_token=CACHE_API_TOKEN,
     max_mb=CACHE_MAX_MB,
+    quotes_max_mb=QUOTES_CACHE_MAX_MB,
     port=CACHE_PORT,
 )
 
@@ -332,6 +334,7 @@ def archive_finished_fixture(fixture_row: dict, season_index: SeasonIndex) -> bo
     # sezon su an sicak (cache'te) ise yerinde guncelle; degilse no-op —
     # bir sonraki HTTP istegi zaten taze veriyle sezonu isitir
     cache_server.update_event(event_row, season_slug)
+    cache_server.update_quotes(event_id, quotes, season_slug)
 
     if quotes:
         try:
@@ -382,10 +385,6 @@ def _tick(loop_start: int, season_index: SeasonIndex, active: dict, last_bulleti
                     traceback.print_exc()
                     continue
 
-                # fixture tablosuna baseline satirlari yaz (odds=[] ile,
-                # asagidaki odds-poll dongusu daha sonra doldurur). watcher
-                # artik fetchday.py'nin ayrica cron ile calistirilmasina
-                # ihtiyac duymadan gunun fixture'larini kendisi yaziyor.
                 if matches:
                     if DRY_RUN:
                         print(
@@ -455,7 +454,7 @@ def _tick(loop_start: int, season_index: SeasonIndex, active: dict, last_bulleti
 
             to_kickoff = kickoff_ts - loop_start
             if to_kickoff < -POST_KICKOFF_GRACE:
-                continue  # kickoff'tan uzun sure sonra — odds artik degismez
+                continue
 
             interval = NEAR_POLL if to_kickoff <= NEAR_WINDOW else SCHEDULED_POLL
             if loop_start - parse_iso(st.get("last_polled_at")) < interval:

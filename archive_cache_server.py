@@ -26,12 +26,25 @@ Kullanim (watcher.py icinde):
         supabase_key=SUPABASE_KEY,
         auth_token=os.environ.get("CACHE_API_TOKEN", ""),
         max_mb=int(os.environ.get("CACHE_MAX_MB", "300")),
+        quotes_max_mb=int(os.environ.get("QUOTES_CACHE_MAX_MB", "150")),
         port=int(os.environ.get("PORT", "8000")),
     )
     cache_server.start()  # arka plan thread'inde HTTP server acar
 
     # her basarili archive_finished_fixture(...) sonrasinda:
     cache_server.update_event(event_row, season_slug)
+    cache_server.update_quotes(event_id, quotes, season_slug)
+
+quotes cache — NEDEN:
+  oddsvig.com/scorepop tarafinda /analyze aramasi eskiden DuckDB ile
+  events.markets_json'u ATTACH edilen Postgres'ten UNNEST ederek
+  "quotes_flat" tablosunu SIFIRDAN insa ediyordu — bu hem agir (Railway'i
+  502/OOM'a goturuyordu) hem de GEREKSIZDI: watcher zaten her mac
+  arsivlerken ayni satirlari (quote_rows_from_fixture) hesaplayip
+  Supabase'in "quotes" tablosuna yaziyor. Yani flat veri zaten var —
+  Railway'in onu markets_json'dan yeniden turetmesine gerek yok.
+  Bu cache, watcher'in zaten urettigi bu satirlari (Postgres'e ayrica
+  gitmeden) dogrudan bellekte tutup HTTP'den servis eder.
 """
 from __future__ import annotations
 
@@ -60,6 +73,16 @@ class _SeasonEntry:
         self.events_by_id = events_by_id  # id -> event dict (decompressed, guncelleme icin)
 
 
+class _QuotesSeasonEntry:
+    __slots__ = ("gz_bytes", "row_count", "built_at", "quotes_by_event")
+
+    def __init__(self, gz_bytes: bytes, quotes_by_event: dict, built_at: float):
+        self.gz_bytes = gz_bytes
+        self.row_count = sum(len(v) for v in quotes_by_event.values())
+        self.built_at = built_at
+        self.quotes_by_event = quotes_by_event  # event_id -> [quote_row, ...]
+
+
 class ArchiveCacheServer:
     EVENT_COLS = (
         "id,source,source_event_id,sport,competition,home_team,away_team,"
@@ -69,18 +92,25 @@ class ArchiveCacheServer:
         "home_ht_score,away_ht_score,season_slug,home_team_id,away_team_id"
     )
 
+    QUOTE_COLS = (
+        "event_id,season_slug,bookmaker_id,betting_type,betting_scope,"
+        "side,opening,current,active,kickoff_at"
+    )
+
     def __init__(
         self,
         supabase_url: str,
         supabase_key: str,
         auth_token: str = "",
         max_mb: int = 300,
+        quotes_max_mb: int = 150,
         port: int = 8000,
     ) -> None:
         self.supabase_url = supabase_url.rstrip("/")
         self.supabase_key = supabase_key
         self.auth_token = auth_token
         self.max_bytes = max_mb * 1024 * 1024
+        self.quotes_max_bytes = quotes_max_mb * 1024 * 1024
         self.port = port
 
         self._lock = threading.RLock()
@@ -89,6 +119,11 @@ class ArchiveCacheServer:
         self._current_bytes = 0
         self._seasons_meta_cache: list | None = None
         self._seasons_meta_at = 0.0
+
+        # quotes icin AYRI LRU + bellek butcesi (events cache'inden bagimsiz)
+        self._quotes_lock = threading.RLock()
+        self._quotes_seasons: "OrderedDict[str, _QuotesSeasonEntry]" = OrderedDict()
+        self._quotes_current_bytes = 0
 
     # ---------------- Supabase REST yardimcilari ----------------
 
@@ -138,6 +173,17 @@ class ArchiveCacheServer:
                 "source": "eq.flashscore",
                 "season_slug": f"eq.{season_slug}",
                 "order": "kickoff_at.asc",
+            },
+        )
+
+    def _fetch_season_quotes(self, season_slug: str) -> list:
+        # quotes tablosu zaten flat (markets_json'daki gibi nested degil) —
+        # burada hicbir unnest/parse gerekmiyor, dogrudan satirlari cekiyoruz.
+        return self._rest_get_paginated(
+            "quotes",
+            {
+                "select": self.QUOTE_COLS,
+                "season_slug": f"eq.{season_slug}",
             },
         )
 
@@ -201,6 +247,61 @@ class ArchiveCacheServer:
             self._seasons.move_to_end(season_slug)
             self._evict_if_needed()
 
+    # ---------------- quotes cache (flat — unnest gerekmiyor) ----------------
+
+    def _evict_quotes_if_needed(self) -> None:
+        # cagiran zaten _quotes_lock tutuyor olmali
+        while self._quotes_current_bytes > self.quotes_max_bytes and self._quotes_seasons:
+            _slug, entry = self._quotes_seasons.popitem(last=False)
+            self._quotes_current_bytes -= len(entry.gz_bytes)
+
+    def get_quotes_season_gz(self, season_slug: str) -> bytes:
+        with self._quotes_lock:
+            entry = self._quotes_seasons.get(season_slug)
+            if entry is not None:
+                self._quotes_seasons.move_to_end(season_slug)
+                return entry.gz_bytes
+
+        rows = self._fetch_season_quotes(season_slug)
+        quotes_by_event: dict[str, list] = {}
+        for r in rows:
+            quotes_by_event.setdefault(r["event_id"], []).append(r)
+        payload = json.dumps(
+            {"ok": True, "season": season_slug, "quotes": rows}
+        ).encode("utf-8")
+        gz = gzip.compress(payload, compresslevel=6)
+
+        with self._quotes_lock:
+            entry = _QuotesSeasonEntry(gz, quotes_by_event, time.time())
+            self._quotes_seasons[season_slug] = entry
+            self._quotes_seasons.move_to_end(season_slug)
+            self._quotes_current_bytes += len(gz)
+            self._evict_quotes_if_needed()
+        return gz
+
+    def update_quotes(self, event_id: str, quotes: list[dict], season_slug: str | None) -> None:
+        """watcher basarili arsivleme sonrasi cagirir (quote_rows_from_fixture
+        ciktisiyla). Sezon cache'te degilse no-op — sonraki HTTP istegi
+        Postgres'ten (zaten flat olan quotes tablosundan) taze ceker."""
+        if not season_slug:
+            return
+        with self._quotes_lock:
+            entry = self._quotes_seasons.get(season_slug)
+            if entry is None:
+                return
+            entry.quotes_by_event[event_id] = quotes
+            all_rows = [q for rows in entry.quotes_by_event.values() for q in rows]
+            payload = json.dumps(
+                {"ok": True, "season": season_slug, "quotes": all_rows}
+            ).encode("utf-8")
+            gz = gzip.compress(payload, compresslevel=6)
+            self._quotes_current_bytes += len(gz) - len(entry.gz_bytes)
+            entry.gz_bytes = gz
+            entry.row_count = len(all_rows)
+            entry.built_at = time.time()
+            self._quotes_seasons.move_to_end(season_slug)
+            self._evict_quotes_if_needed()
+
     def get_event(self, event_id: str) -> dict | None:
         with self._lock:
             for entry in self._seasons.values():
@@ -215,8 +316,7 @@ class ArchiveCacheServer:
 
     def stats(self) -> dict:
         with self._lock:
-            return {
-                "status": "ok",
+            events_stats = {
                 "cached_seasons": len(self._seasons),
                 "cache_bytes": self._current_bytes,
                 "cache_mb": round(self._current_bytes / (1024 * 1024), 2),
@@ -226,6 +326,18 @@ class ArchiveCacheServer:
                     for s, e in self._seasons.items()
                 ],
             }
+        with self._quotes_lock:
+            quotes_stats = {
+                "cached_seasons": len(self._quotes_seasons),
+                "cache_bytes": self._quotes_current_bytes,
+                "cache_mb": round(self._quotes_current_bytes / (1024 * 1024), 2),
+                "max_mb": round(self.quotes_max_bytes / (1024 * 1024), 2),
+                "seasons": [
+                    {"slug": s, "rows": e.row_count, "built_at": e.built_at}
+                    for s, e in self._quotes_seasons.items()
+                ],
+            }
+        return {"status": "ok", "events": events_stats, "quotes": quotes_stats}
 
     # ---------------- HTTP server ----------------
 
@@ -242,26 +354,28 @@ class ArchiveCacheServer:
                 return self.headers.get("Authorization") == f"Bearer {server.auth_token}"
 
             def _send_json_gz(self, gz_bytes: bytes, status: int = 200) -> None:
-                # Istemci gercekten gzip kabul ediyorsa (tarayici / fetch / --compressed
-                # curl) sikistirilmis gonder; etmiyorsa (duz curl, Koyeb'in proxy'si vb.)
-                # duz JSON'a cevirip Content-Encoding basma. Aksi halde araya giren
-                # proxy'ler govdeyi kendileri decompress edip header'i degistirmeden
-                # birakabiliyor, bu da istemci tarafinda "unknown compression format"
-                # hatasina yol aciyor.
-                accept_encoding = self.headers.get("Accept-Encoding", "")
-                client_wants_gzip = "gzip" in accept_encoding.lower()
-
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Cache-Control", "public, max-age=30")
-                if client_wants_gzip:
+                # Istemci gzip kabul ettigini soylemediyse (Accept-Encoding
+                # yok — ornegin curl --compressed olmadan) sikistirilmis
+                # bytes'i Content-Encoding: gzip ile yollamak, araya giren
+                # proxy'lerin (Koyeb edge dahil) sessizce decode edip
+                # header'i yanlis birakmasina yol acabiliyor — sonuc, istemci
+                # tarafinda "gunzip: unknown format" gibi bir hataya donuyor.
+                # Standart HTTP davranisi: sadece istemci istediyse sikistir.
+                accept_enc = self.headers.get("Accept-Encoding", "")
+                if "gzip" in accept_enc:
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Encoding", "gzip")
                     self.send_header("Content-Length", str(len(gz_bytes)))
+                    self.send_header("Cache-Control", "public, max-age=30")
                     self.end_headers()
                     self.wfile.write(gz_bytes)
                 else:
                     body = gzip.decompress(gz_bytes)
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "public, max-age=30")
                     self.end_headers()
                     self.wfile.write(body)
 
@@ -277,8 +391,6 @@ class ArchiveCacheServer:
                 try:
                     parsed = urlparse(self.path)
                     path = parsed.path
-                    if len(path) > 1 and path.endswith("/"):
-                        path = path.rstrip("/")  # /health/ -> /health, /seasons/ -> /seasons
 
                     if path == "/health":
                         self._send_json(server.stats())
@@ -308,6 +420,15 @@ class ArchiveCacheServer:
                             self._send_json({"ok": False, "error": "not found"}, status=404)
                             return
                         self._send_json({"ok": True, "event": event})
+                        return
+
+                    if path.startswith("/quotes/season/"):
+                        slug = path[len("/quotes/season/"):]
+                        if not slug:
+                            self._send_json({"ok": False, "error": "season slug gerekli"}, status=400)
+                            return
+                        gz = server.get_quotes_season_gz(slug)
+                        self._send_json_gz(gz)
                         return
 
                     self._send_json({"ok": False, "error": "not found"}, status=404)
