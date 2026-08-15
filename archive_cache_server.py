@@ -102,8 +102,8 @@ class ArchiveCacheServer:
 
     # markets_json YOK — smart-match taramasi bunu hic gormez (bellek/bant tasarrufu)
     EVENT_META_COLS = (
-        "id,season_slug,competition,home_team,away_team,kickoff_at,"
-        "home_score,away_score"
+        "id,source_event_id,season_slug,competition,round,home_team,away_team,kickoff_at,"
+        "home_score,away_score,home_ht_score,away_ht_score"
     )
 
     def __init__(
@@ -297,14 +297,7 @@ class ArchiveCacheServer:
                 self._quotes_seasons.move_to_end(season_slug)
                 return entry.gz_bytes
 
-        # cache disinda -> once GitHub tarihsel arsivine bak (Supabase'e hic
-        # gitmeden, get_season_gz ile AYNI kaynak/dosyadan — raw-cache
-        # sayesinde events zaten cekildiyse ikinci indirme olmaz), yoksa
-        # Postgres'e dus (canli/yakin donem sezonlar icin)
-        if self.github_source is not None and self.github_source.has(season_slug):
-            rows = self.github_source.load_quotes(season_slug) or []
-        else:
-            rows = self._fetch_season_quotes(season_slug)
+        rows = self._fetch_season_quotes(season_slug)
         quotes_by_event: dict[str, list] = {}
         for r in rows:
             quotes_by_event.setdefault(r["event_id"], []).append(r)
@@ -359,6 +352,17 @@ class ArchiveCacheServer:
             while len(self._meta_seasons) > META_SEASON_CACHE_MAX:
                 self._meta_seasons.popitem(last=False)
         return rows
+
+    def get_events_meta_season(self, season_slug: str) -> list:
+        """/events/season/{slug} icin — _get_meta_light'in public alias'i.
+        markets_json YOK, sadece odds-web'in quotes_flat materialize adiminda
+        event'e (team/skor/rakip) baglamak icin gereken hafif kolonlar."""
+        return self._get_meta_light(season_slug)
+
+    def get_events_meta_season_gz(self, season_slug: str) -> bytes:
+        events = self.get_events_meta_season(season_slug)
+        payload = json.dumps({"ok": True, "season": season_slug, "events": events}).encode("utf-8")
+        return gzip.compress(payload, compresslevel=6)
 
     @staticmethod
     def _quote_dict_to_row(q: dict) -> list:
@@ -572,6 +576,20 @@ class ArchiveCacheServer:
                             self._send_json({"ok": False, "error": "season slug gerekli"}, status=400)
                             return
                         gz = server.get_quotes_season_gz(slug)
+                        self._send_json_gz(gz)
+                        return
+
+                    if path.startswith("/events/season/"):
+                        slug = path[len("/events/season/"):]
+                        if not slug:
+                            self._send_json({"ok": False, "error": "season slug gerekli"}, status=400)
+                            return
+                        try:
+                            gz = server.get_events_meta_season_gz(slug)
+                        except Exception as exc:  # noqa: BLE001
+                            traceback.print_exc()
+                            self._send_json({"ok": False, "error": str(exc)}, status=500)
+                            return
                         self._send_json_gz(gz)
                         return
 
