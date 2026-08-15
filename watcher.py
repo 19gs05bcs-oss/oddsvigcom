@@ -154,9 +154,14 @@ def _strip_year_suffix(s: str | None) -> str:
 
 
 class SeasonIndex:
-    """seasons tablosunun bellekteki kopyasi + prefix->en-yeni-yil eslemesi."""
+    """seasons tablosunun bellekteki kopyasi + prefix->en-yeni-yil eslemesi.
+    github_source verildiyse (tarihsel arsiv artik Supabase'e YAZILMIYOR),
+    Supabase'deki canli-takip sezonlariyla GithubArchiveSource'un kendi
+    index'i BIRLESTIRILIR — yoksa bu liglerin bugunku bitmis maclari
+    season_slug=None kalir (Supabase'de hic 'seasons' satiri olmadigi icin)."""
 
-    def __init__(self) -> None:
+    def __init__(self, github_source=None) -> None:
+        self.github_source = github_source
         self.by_id: set[str] = set()
         self.by_prefix: dict[str, list[tuple[int, str]]] = defaultdict(list)
         self.by_competition: dict[str, list[tuple[int, str]]] = defaultdict(list)
@@ -167,6 +172,14 @@ class SeasonIndex:
             "seasons",
             {"select": "id,competition", "source": "eq.flashscore", "limit": "5000"},
         )
+        if self.github_source is not None:
+            # ayni id Supabase'de de varsa Supabase kazanir (guncel/canli veri)
+            known_ids = {r["id"] for r in rows}
+            rows = rows + [
+                {"id": r["id"], "competition": r["competition"]}
+                for r in self.github_source.meta_rows()
+                if r["id"] not in known_ids
+            ]
         by_id = {r["id"] for r in rows}
         by_prefix: dict[str, list[tuple[int, str]]] = defaultdict(list)
         by_competition: dict[str, list[tuple[int, str]]] = defaultdict(list)
@@ -527,7 +540,7 @@ def _tick(loop_start: int, season_index: SeasonIndex, active: dict, last_bulleti
 
 
 def run() -> None:
-    season_index = SeasonIndex()
+    season_index = SeasonIndex(github_source=github_source)
     season_index.refresh()
 
     last_bulletin = 0
