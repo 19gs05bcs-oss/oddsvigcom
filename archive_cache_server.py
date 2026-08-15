@@ -297,7 +297,14 @@ class ArchiveCacheServer:
                 self._quotes_seasons.move_to_end(season_slug)
                 return entry.gz_bytes
 
-        rows = self._fetch_season_quotes(season_slug)
+        # get_season_gz() ile AYNI kaynak sirasi: once GitHub tarihsel
+        # arsivine bak (Supabase'e hic gitmeden), yoksa Postgres'e dus.
+        # DAHA ONCE bu fallback eksikti — GitHub-only sezonlarda
+        # /quotes/season/ sessizce bos donuyordu.
+        if self.github_source is not None and self.github_source.has(season_slug):
+            rows = self.github_source.load_quotes(season_slug) or []
+        else:
+            rows = self._fetch_season_quotes(season_slug)
         quotes_by_event: dict[str, list] = {}
         for r in rows:
             quotes_by_event.setdefault(r["event_id"], []).append(r)
@@ -345,7 +352,15 @@ class ArchiveCacheServer:
             if rows is not None:
                 self._meta_seasons.move_to_end(season_slug)
                 return rows
-        rows = self._fetch_season_meta_light(season_slug)
+        # Ayni kaynak sirasi: once GitHub tarihsel arsivi, yoksa Postgres.
+        # DAHA ONCE bu fallback de eksikti — GitHub-only sezonlarda
+        # /events/season/ sessizce bos donuyordu.
+        if self.github_source is not None and self.github_source.has(season_slug):
+            full_events = self.github_source.load_events(season_slug) or []
+            meta_cols = [c.strip() for c in self.EVENT_META_COLS.split(",")]
+            rows = [{k: e.get(k) for k in meta_cols} for e in full_events]
+        else:
+            rows = self._fetch_season_meta_light(season_slug)
         with self._meta_lock:
             self._meta_seasons[season_slug] = rows
             self._meta_seasons.move_to_end(season_slug)
