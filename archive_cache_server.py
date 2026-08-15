@@ -114,6 +114,7 @@ class ArchiveCacheServer:
         max_mb: int = 300,
         quotes_max_mb: int = 150,
         port: int = 8000,
+        github_source=None,  # GithubArchiveSource | None — tarihsel arsiv, Supabase'e yazmadan
     ) -> None:
         self.supabase_url = supabase_url.rstrip("/")
         self.supabase_key = supabase_key
@@ -121,6 +122,7 @@ class ArchiveCacheServer:
         self.max_bytes = max_mb * 1024 * 1024
         self.quotes_max_bytes = quotes_max_mb * 1024 * 1024
         self.port = port
+        self.github_source = github_source
 
         self._lock = threading.RLock()
         # LRU: en son kullanilan sona eklenir; asim durumunda basdan atilir
@@ -219,6 +221,11 @@ class ArchiveCacheServer:
             if self._seasons_meta_cache is not None and now - self._seasons_meta_at < ttl:
                 return self._seasons_meta_cache
         data = self._fetch_seasons_meta()
+        if self.github_source is not None:
+            # Supabase'deki (canli takip) sezonlarla GitHub tarihsel arsivini
+            # birlestir; ayni slug ikisinde de varsa Supabase kaydi kazanir.
+            known = {row["id"] for row in data}
+            data = data + [row for row in self.github_source.meta_rows() if row["id"] not in known]
         with self._lock:
             self._seasons_meta_cache = data
             self._seasons_meta_at = now
@@ -237,8 +244,12 @@ class ArchiveCacheServer:
                 self._seasons.move_to_end(season_slug)  # LRU: en yeni kullanilan sona
                 return entry.gz_bytes
 
-        # cache disinda -> Postgres'ten cek (lock disinda, IO blocklamasin)
-        events = self._fetch_season_events(season_slug)
+        # cache disinda -> once GitHub tarihsel arsivine bak (Supabase'e hic
+        # gitmeden), yoksa Postgres'e dus (lock disinda, IO blocklamasin)
+        if self.github_source is not None and self.github_source.has(season_slug):
+            events = self.github_source.load_events(season_slug) or []
+        else:
+            events = self._fetch_season_events(season_slug)
         events_by_id = {e["id"]: e for e in events}
         payload = json.dumps({"ok": True, "season": season_slug, "events": events}).encode("utf-8")
         gz = gzip.compress(payload, compresslevel=6)

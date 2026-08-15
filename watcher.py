@@ -44,6 +44,7 @@ from import_fixture_supabase import row_from_match
 from import_season_supabase import upsert_adaptive, supabase_headers
 from flashscore_markets import build_markets_blob, competition_label
 from archive_cache_server import ArchiveCacheServer
+from github_archive_source import GithubArchiveSource
 
 # ---------------- ayarlar (saniye) ----------------
 
@@ -75,6 +76,27 @@ CACHE_MAX_MB = int(os.environ.get("CACHE_MAX_MB", "300"))
 QUOTES_CACHE_MAX_MB = int(os.environ.get("QUOTES_CACHE_MAX_MB", "150"))
 CACHE_PORT = int(os.environ.get("PORT", "8000"))
 
+# ---------------- tarihsel sezon arsivi: dogrudan GitHub'dan (Supabase'e YAZILMAZ) ----------------
+# listener private oldugu icin repo scope/contents:read yetkili bir token gerekir
+# (Koyeb'de GITHUB_TOKEN env degiskeni olarak set edilmeli).
+LISTENER_REPO = os.environ.get("LISTENER_REPO", "19gs05bcs-oss/listener")
+LISTENER_REF = os.environ.get("LISTENER_REF", "")
+LISTENER_PATH = os.environ.get("LISTENER_PATH", "data/season_odds")
+LISTENER_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+
+github_source = None
+if LISTENER_REF and LISTENER_TOKEN:
+    github_source = GithubArchiveSource(
+        repo=LISTENER_REPO, ref=LISTENER_REF, path=LISTENER_PATH, token=LISTENER_TOKEN,
+    )
+    github_source.start_background()  # index'i arka planda cikarir, boot'u bloklamaz
+else:
+    print(
+        "[!] LISTENER_REF / GITHUB_TOKEN yok — tarihsel GitHub arsivi devre disi "
+        "(sadece Supabase'deki canli-takip sezonlari servis edilir)",
+        file=sys.stderr,
+    )
+
 cache_server = ArchiveCacheServer(
     supabase_url=SUPABASE_URL,
     supabase_key=SUPABASE_KEY,
@@ -82,6 +104,7 @@ cache_server = ArchiveCacheServer(
     max_mb=CACHE_MAX_MB,
     quotes_max_mb=QUOTES_CACHE_MAX_MB,
     port=CACHE_PORT,
+    github_source=github_source,
 )
 
 
