@@ -60,7 +60,10 @@ from urllib.parse import urlparse
 
 import requests
 
+from smart_match_report import build_smart_match_report
+
 REST_PAGE_SIZE = 1000  # PostgREST varsayilan max-rows genelde 1000'dir
+META_SEASON_CACHE_MAX = 40  # /smart-match/report icin: en fazla N sezonun hafif meta'si tutulur
 
 
 class _SeasonEntry:
@@ -97,6 +100,12 @@ class ArchiveCacheServer:
         "side,opening,current,active,kickoff_at"
     )
 
+    # markets_json YOK — smart-match taramasi bunu hic gormez (bellek/bant tasarrufu)
+    EVENT_META_COLS = (
+        "id,season_slug,competition,home_team,away_team,kickoff_at,"
+        "home_score,away_score"
+    )
+
     def __init__(
         self,
         supabase_url: str,
@@ -124,6 +133,10 @@ class ArchiveCacheServer:
         self._quotes_lock = threading.RLock()
         self._quotes_seasons: "OrderedDict[str, _QuotesSeasonEntry]" = OrderedDict()
         self._quotes_current_bytes = 0
+
+        # smart-match/report icin: hafif (markets_json'suz) event meta, sezon basina LRU
+        self._meta_lock = threading.RLock()
+        self._meta_seasons: "OrderedDict[str, list]" = OrderedDict()
 
     # ---------------- Supabase REST yardimcilari ----------------
 
@@ -170,6 +183,17 @@ class ArchiveCacheServer:
             "events",
             {
                 "select": self.EVENT_COLS,
+                "source": "eq.flashscore",
+                "season_slug": f"eq.{season_slug}",
+                "order": "kickoff_at.asc",
+            },
+        )
+
+    def _fetch_season_meta_light(self, season_slug: str) -> list:
+        return self._rest_get_paginated(
+            "events",
+            {
+                "select": self.EVENT_META_COLS,
                 "source": "eq.flashscore",
                 "season_slug": f"eq.{season_slug}",
                 "order": "kickoff_at.asc",
@@ -302,6 +326,108 @@ class ArchiveCacheServer:
             self._quotes_seasons.move_to_end(season_slug)
             self._evict_quotes_if_needed()
 
+    # ---------------- smart-match/report: hafif meta + tek-gecis stream ----------------
+
+    def _get_meta_light(self, season_slug: str) -> list:
+        with self._meta_lock:
+            rows = self._meta_seasons.get(season_slug)
+            if rows is not None:
+                self._meta_seasons.move_to_end(season_slug)
+                return rows
+        rows = self._fetch_season_meta_light(season_slug)
+        with self._meta_lock:
+            self._meta_seasons[season_slug] = rows
+            self._meta_seasons.move_to_end(season_slug)
+            while len(self._meta_seasons) > META_SEASON_CACHE_MAX:
+                self._meta_seasons.popitem(last=False)
+        return rows
+
+    @staticmethod
+    def _quote_dict_to_row(q: dict) -> list:
+        """{bookmaker_id,betting_type,betting_scope,side,opening,current,active}
+        -> [bm_id, btype, bscope, side, opening, current, active] (CompactOddsRow)."""
+        return [
+            q.get("bookmaker_id"),
+            q.get("betting_type"),
+            q.get("betting_scope"),
+            q.get("side"),
+            q.get("opening"),
+            q.get("current"),
+            q.get("active"),
+        ]
+
+    def iter_all_archive_matches(self, season_slugs: list[str] | None = None):
+        """TEK GECISLIK jenerator — her seferinde bir sezonun meta+quotes'unu
+        cekip (cache'ten veya Postgres'ten) satirlari uretir, sonra o sezonu
+        birakip bir sonrakine gecer. HICBIR ZAMAN tum sezonlari ayni anda
+        bellekte tutmaz — bu yuzden 283 sezon da olsa bellek tavani sabittir.
+        """
+        if season_slugs:
+            slugs = list(season_slugs)
+        else:
+            slugs = [s["id"] for s in self.seasons_meta()]
+
+        for slug in slugs:
+            try:
+                meta_rows = self._get_meta_light(slug)
+            except Exception:
+                traceback.print_exc()
+                continue
+            if not meta_rows:
+                continue
+            meta_by_id = {r["id"]: r for r in meta_rows}
+
+            try:
+                gz = self.get_quotes_season_gz(slug)
+                quotes_payload = json.loads(gzip.decompress(gz))
+            except Exception:
+                traceback.print_exc()
+                continue
+
+            quotes_by_event: dict[str, list] = {}
+            for q in quotes_payload.get("quotes", []):
+                quotes_by_event.setdefault(q["event_id"], []).append(q)
+
+            for event_id, ev in meta_by_id.items():
+                qrows = quotes_by_event.get(event_id)
+                if not qrows:
+                    continue
+                hs, aws = ev.get("home_score"), ev.get("away_score")
+                if hs in (None, "") or aws in (None, ""):
+                    continue
+                try:
+                    hs, aws = float(hs), float(aws)
+                except (TypeError, ValueError):
+                    continue
+                yield {
+                    "id": event_id,
+                    "season": ev.get("season_slug") or slug,
+                    "home": ev.get("home_team") or "Home",
+                    "away": ev.get("away_team") or "Away",
+                    "kickoff": ev.get("kickoff_at"),
+                    "homeScore": hs,
+                    "awayScore": aws,
+                    "odds": [self._quote_dict_to_row(q) for q in qrows],
+                    "bookmakers": None,  # quotes flat kayittan isim gelmiyor; grid id ile de calisir
+                }
+            # bu noktada meta_rows / quotes_payload / quotes_by_event artik
+            # referans edilmiyor -> bir sonraki dongude GC edilebilir
+
+    def run_smart_match_report(
+        self,
+        fixture: dict,
+        season_slugs: list[str] | None = None,
+        reference_bm: int | None = None,
+        tolerance_pct: float = 0.03,
+    ) -> dict:
+        return build_smart_match_report(
+            fixture=fixture,
+            archive_iter=self.iter_all_archive_matches(season_slugs),
+            archive_source="koyeb:quotes-stream",
+            reference_bm=reference_bm,
+            tolerance_pct=tolerance_pct,
+        )
+
     def get_event(self, event_id: str) -> dict | None:
         with self._lock:
             for entry in self._seasons.values():
@@ -433,6 +559,51 @@ class ArchiveCacheServer:
 
                     self._send_json({"ok": False, "error": "not found"}, status=404)
                 except Exception as exc:  # noqa: BLE001 - HTTP handler ust seviye guvenlik agi
+                    traceback.print_exc()
+                    self._send_json({"ok": False, "error": str(exc)}, status=500)
+
+            def do_POST(self) -> None:  # noqa: N802 - stdlib imzasi
+                try:
+                    parsed = urlparse(self.path)
+                    path = parsed.path
+
+                    if not self._authed():
+                        self._send_json({"ok": False, "error": "unauthorized"}, status=401)
+                        return
+
+                    if path == "/smart-match/report":
+                        length = int(self.headers.get("Content-Length") or 0)
+                        raw = self.rfile.read(length) if length else b"{}"
+                        try:
+                            body = json.loads(raw or b"{}")
+                        except json.JSONDecodeError:
+                            self._send_json({"ok": False, "error": "gecersiz JSON body"}, status=400)
+                            return
+
+                        fixture = body.get("fixture") or {}
+                        if not fixture.get("match_id") or not fixture.get("odds"):
+                            self._send_json(
+                                {"ok": False, "error": "fixture.match_id ve fixture.odds gerekli"},
+                                status=400,
+                            )
+                            return
+                        seasons = body.get("seasons") or None
+                        try:
+                            report = server.run_smart_match_report(
+                                fixture=fixture,
+                                season_slugs=seasons,
+                                reference_bm=body.get("referenceBm"),
+                                tolerance_pct=float(body.get("tolerancePct") or 0.03),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            traceback.print_exc()
+                            self._send_json({"ok": False, "error": str(exc)}, status=500)
+                            return
+                        self._send_json({"ok": True, "report": report})
+                        return
+
+                    self._send_json({"ok": False, "error": "not found"}, status=404)
+                except Exception as exc:  # noqa: BLE001
                     traceback.print_exc()
                     self._send_json({"ok": False, "error": str(exc)}, status=500)
 
